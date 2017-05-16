@@ -1,0 +1,5 @@
+#! /bin/bash
+
+ME=`whoami`
+Place=/users/${ME}/TrunkHealthBits
+echo ${Place}

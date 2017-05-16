@@ -1,0 +1,461 @@
+#! /bin/bash
+
+#set -x
+#set -o functrace
+
+Usage(){
+    echo "Usage: $0"
+    echo "    product_name"
+    echo "    profile"
+    echo "    recipedir"
+    echo "    outdir"
+    echo "    filesphppath"
+    echo "    gallery_dir"
+    echo "    gallery_base_url"
+    echo "    api_post_url"
+}
+
+moveResults(){
+    local src="$1"
+    local dst="$2"
+    local basename="${src##*/}"
+
+    # only move stuff if our directory is not already at the dest.
+
+    if [[ ! -d "$src" ]]; then
+        msg "Cannot move results, it is not a directory!";
+        return 42
+    fi
+
+    if [[ -e "${dst}/${basename}" ]] ; then
+        echo "Cannot move results, dest is unavailable!."
+        return 43
+    fi
+
+    mv "$src" "$dst"
+    return $?
+}
+
+writeReport(){
+    local report_filepath="${1}"
+    local profile="${2}"
+    local product_name="${3}"
+    local repo_name="${4}"
+    local repo_sha="${5}"
+    local ts_start="${6}"
+    local ts_stop="${7}"
+    local result="${8}"
+    local total_size_bytes="${9}"
+    local target_dir_size_bytes="${10}"
+    local gallery_dir_size_bytes="${11}"
+
+    # initialize report variables to conservative values
+    local pass_fail="false"
+    if [ $result -eq 0 ]; then pass_fail="true"; fi
+
+    cat <<REPORT | jq -M --indent 4 '.' > "${report_filepath}"
+{
+    "${product_name}": {
+        "build_results": {
+            "build_repo": "${repo_name}",
+            "build_sha": "${repo_sha}",
+            "build_time_start": "${ts_start}",
+            "build_time_stop": "${ts_stop}",
+            "build_success": "${pass_fail}",
+            "build_type": "trunk_health",
+            "type": "distribution",
+            "metrics":{
+                "total_bytes": ${total_size_bytes},
+                "target_dir_bytes": ${target_dir_size_bytes},
+                "gallery_bytes": ${gallery_dir_size_bytes}
+            }
+        },
+        "profile_details": ${profile}
+    }
+}
+REPORT
+}
+
+genPostData(){
+    local _rpostdata=${1}
+    local profile="${2}"
+    local recipe_dir="${3}"
+    local recipe_sha="${4}"
+    local ts_start="${5}"
+    local ts_end="${6}"
+    local result="${7}"
+    local output_dir="${8}"
+    local gallery_url="${9}"
+    local postdata_file="${10}"
+
+    # initialize API variables to conservative values
+    local pass_fail="false"
+    local distro_json="{}"
+    local distro_manifest="[]"
+    local postdata="${_rpostdata}"
+
+    local gen_recipe=$(shopt -s nullglob; for f in "${output_dir}"/*.yaml; do if [[ ! -z "$f" ]]; then echo "$f"; fi; break; done)
+    if [[ ! -z "${gen_recipe}" && -f "${gen_recipe}" ]]; then
+        # if we have the generated recipe we can use that to get info
+        distro_json=$(ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load(ARGF))' < "${gen_recipe}" || local distro_json="{}")
+    else
+        # otherwise we can use the repo's recipe file for minimal distro info
+        local distro_recipe_name=$(printf '%s' "${profile}" | jq -Mr '{d:(.distribution|gsub("_%p";"")),h:(if(.distribution|test("_%p"))then("_"+.hw_phase)else("")end)}|.d+.h+".yaml"') || local distro_recipe_name=""
+        distro_json=$(ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load(ARGF))' < "${recipe_dir}/${distro_recipe_name}" || local distro_json="{}")
+        msg "could not find generated recipe in output directory!"
+        result=100
+    fi
+
+    local distro_name_phase_version=$(printf "%s" "${distro_json}" | jq -Mr '{n:(.name//"none"),p:(.phase//"none"),v:(.major_version//"none")}|.n+" "+.p+" "+.v')
+
+    # try and populate the manifest
+    local gen_manifest=$(shopt -s nullglob; for f in "${output_dir}"/*_manifest.info; do if [[ ! -z "$f" ]]; then echo "$f"; fi; break; done)
+    if [[ ! -z "${gen_manifest}" && -f "${gen_manifest}" ]]; then
+        distro_manifest=$(jq -MR --slurp 'split("\n")[:-1]' < "${gen_manifest}" || distro_manifest="[]" )
+    else
+        # if no manifest, usually means build failed.
+        msg "could not find generated manifest in output directory!"
+        result=101
+    fi
+
+    if [ $result -eq 0 ]; then pass_fail="true"; fi
+
+    # Sirius Hub API
+    postdata=$(cat <<API | jq -Mrjc '.|@uri' | printf "json_data=%s" "$(cat -)" | tee "${postdata_file}"
+    {
+        "time_start": "${ts_start}",
+        "time_end": "${ts_end}",
+        "distribution_results":[{
+            "name": "${distro_name_phase_version}",
+            "success": ${pass_fail},
+            "location_of_binaries": "${gallery_url}",
+            "recipe_cset":"${recipe_sha}",
+            "manifest": ${distro_manifest}
+        }]
+    }
+API
+    )
+
+    eval $_rpostdata=\$postdata
+}
+
+postSH(){
+    local postdata="${1}"
+    local api_post_url="${2}"
+
+    # Sirius Hub API
+    curl --insecure                       \
+         --request POST                   \
+         --user-agent 'PWSHealth/1.0'     \
+         --connect-timeout 60             \
+         --max-time 600                   \
+         --data "${postdata}"             \
+         --header 'Content-Type: application/x-www-form-urlencoded' \
+         ${api_post_url}
+
+    return $?
+}
+
+#         --proxy localhost:8000           \
+getProfileContents(){
+    local profile_path="$1"
+    ruby -ryaml -rjson -e 'puts JSON.generate(YAML.load(ARGF))' < "${profile_path}" || echo "{}"
+}
+
+unsetTraps(){
+    for signal in "$@"; do
+        trap - $signal
+    done
+}
+
+# env $LOGFILE
+msg(){
+    local m="$1"
+
+    local LFILE="$S_LOGFILE"
+    if [[ ! -f "$LFILE" ]]; then
+        LFILE="/dev/stdout"
+    fi
+
+    echo "$m" >> "$LFILE"
+}
+
+retryDeleteUntil(){
+    local d="$1"
+    local until="$2"
+
+    if [[ "x${d}" != "x" && "x${d}" != "x/" && -e "$d" ]]; then
+        for (( try=0; try < ${until}; try++ )); do
+            rm -rf "$d" > /dev/null 2>&1
+            if [[ $? -ne 0 ]]; then
+                sleep 1
+            else
+                break
+            fi
+        done
+    fi
+}
+
+trapCleanUp(){
+    cleanUp
+    deleteBuildObjs
+    moveDanglingFiles
+}
+
+moveDanglingFiles(){
+    if [ ! -d "$S_WORKSPACE" ]; then
+        mkdir "$S_WORKSPACE"
+    fi
+
+    for (( f=0; f < ${#S_FILES_TO_MOVE[@]}; f+=2 )); do
+        if [[ -f "${S_FILES_TO_MOVE[$f]}" ]]; then
+            mv "${S_FILES_TO_MOVE[$f]}" "${S_WORKSPACE}/${S_FILES_TO_MOVE[$f+1]}"
+            # if we moved the log file update the reference
+            if [[ "${S_FILES_TO_MOVE[$f+1]}" == "${S_LOGFILE_NAME}" ]]; then
+                S_LOGFILE="${S_WORKSPACE}/${S_LOGFILE_NAME}"
+            fi
+        fi
+    done
+    S_FILES_TO_MOVE=()
+}
+
+cleanUp(){
+    if [ "$S_STATUS" -ne "0" ] ; then
+	local pids=$(jobs -pr)
+        if [ -n "$pids" ]; then
+            echo $pids | xargs kill -SIGINT
+	    echo "killing children:"
+            for pid in $pids; do
+                printf "  signal [ %6s ] ... " "$pid"
+                wait $pid
+                printf "dead ( %3s )\n" $?
+            done
+        fi
+
+        if [ -d "${S_WORKSPACE}" ] ; then
+            if [ -d "${S_WORKSPACE}/.pseudo" ]; then
+                # special treatment for .pseudo directory. 
+                retryDeleteUntil "${S_WORKSPACE}/.pseudo" 120
+            fi
+            rm -rf "${S_WORKSPACE}"
+	fi
+    fi
+}
+
+deleteBuildObjs(){
+    if [ -d "${S_WORKSPACE}" ] ; then
+        if [ -d "${S_WORKSPACE}/.pseudo" ]; then
+            # special treatment for .pseudo directory.
+            retryDeleteUntil "${S_WORKSPACE}/.pseudo" 120
+        fi
+        
+        msg "clean up extraenous files"
+        for R in "${S_REMOVAL_LIST[@]}"; do
+            # Because we glob, loop through results
+            R="${S_WORKSPACE}/${R}"
+            for F in $R; do
+                if [ "${F}" != "/" ] && [ -e "$F" ] ; then
+                    rm -r "$F"
+                    msg "removed $F"
+                fi
+            done
+        done
+    fi
+}
+
+#
+# main
+#
+if [ "$#" -lt 7 ] ; then
+    Usage
+    exit 1
+fi
+
+S_PRODUCT_NAME="${1}"
+S_PROFILE_PATH="${2}"
+S_RECIPE_DIR="${3}"
+S_OUTPUT_DIR="${4}"
+S_FILES_PHP_PATH="${5}"
+S_GALLERY_BASE_DIR="${6}"
+S_GALLERY_BASE_URL="${7}"
+S_API_POST_URL="${8}"
+S_FILES_TO_MOVE=()
+
+line=$(cat - )
+S_REMOVAL_LIST=( `echo $line` )
+#for a in ${S_REMOVAL_LIST[@]}; do
+#    echo $a
+#done
+
+S_FILE_PREFIX="build_${S_PRODUCT_NAME}"
+S_REPORT_NAME="${S_FILE_PREFIX}_report.json"
+S_LOGFILE_NAME="${S_FILE_PREFIX}.log"
+S_API_POSTDATA_NAME="${S_FILE_PREFIX}.formdata"
+
+S_LOGFILE=
+S_WORKSPACE="${S_OUTPUT_DIR}/${S_PRODUCT_NAME}"
+S_GALLERY_URL="${S_GALLERY_BASE_URL}${S_PRODUCT_NAME}/"
+S_GALLERY_DIR="${S_GALLERY_BASE_DIR}/${S_PRODUCT_NAME}"
+
+S_PID=$$
+S_PKG_INFO_LOGNAME="build_${S_PRODUCT_NAME}_ci_pkg_info.json"
+
+S_TRAP_SIGNALS=( EXIT SIGINT SIGTERM SIGQUIT )
+S_STATUS=255
+S_TIMESTART=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# basic sanity check the directories and files
+if [ ! -d "$S_OUTPUT_DIR" ]; then
+    msg "output directory '${S_OUTPUT_DIR}' does not exist!"
+    exit 3
+fi
+
+if [ -f "${S_OUTPUT_DIR}/${S_LOGFILE_NAME}" ]; then
+    msg "logfile '${S_LOGFILE}' already exists!"
+    exit 3
+fi
+
+
+#S_REPORT_FILE="${S_WORKSPACE}/${S_REPORT_NAME}"
+S_LOGFILE="${S_OUTPUT_DIR}/${S_LOGFILE_NAME}"              && \
+    S_FILES_TO_MOVE[${#S_FILES_TO_MOVE[@]}]="${S_LOGFILE}" && \
+    S_FILES_TO_MOVE[${#S_FILES_TO_MOVE[@]}]="${S_LOGFILE_NAME}"
+: >"$S_LOGFILE"
+
+# switch to logfile
+if [ ! -d "$S_RECIPE_DIR" ]; then
+    msg "distribution recipe directory '${S_RECIPE_DIR}' does not exist!"
+    exit 3
+fi
+
+trap 'unsetTraps "${S_TRAP_SIGNALS[@]}" ; trapCleanUp' ${S_TRAP_SIGNALS[@]}
+
+msg "$S_PID"
+msg "Start of building '${S_PRODUCT_NAME}'"
+
+S_RECIPE_REPO_INFO=$(git -C "${S_RECIPE_DIR}" ls-remote --get-url origin) || S_RECIPE_REPO_INFO=""
+S_RECIPE_REPO_SHA=$(git -C "${S_RECIPE_DIR}" rev-parse HEAD) || S_RECIPE_SHA=""
+
+trunk_health.rb --ci_yaml "${S_PROFILE_PATH}"             \
+                --ci-pkg-info-log "${S_PKG_INFO_LOGNAME}" \
+                --recipe_dir "${S_RECIPE_DIR}"            \
+                --output_dir "${S_WORKSPACE}"             \
+                --exit-on-warning >> "${S_LOGFILE}" 2>&1 &
+
+#mkdir -p "${S_WORKSPACE}"
+#( sleep $(( ( $RANDOM % 20 ) + 1 )) ) &
+wait $!
+S_STATUS=$?
+S_TIMESTOP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# symlink the files.php API thing
+S_FILES_PHP_NAME="${S_FILES_PHP_PATH##*/}"
+S_FILES_PHP_SYMLINK="${S_OUTPUT_DIR}/${S_FILE_PREFIX}_${S_FILES_PHP_NAME}"
+msg "creating '${S_FILES_PHP_NAME}."
+ln -s "${S_FILES_PHP_PATH}" "${S_FILES_PHP_SYMLINK}"                 && \
+    S_FILES_TO_MOVE[${#S_FILES_TO_MOVE[@]}]="${S_FILES_PHP_SYMLINK}" && \
+    S_FILES_TO_MOVE[${#S_FILES_TO_MOVE[@]}]="${S_FILES_PHP_NAME}"
+
+
+S_PROFILE_CONTENTS=$(getProfileContents "${S_PROFILE_PATH}")
+
+# collect some directory size metrics: total, target
+S_TOTAL_DIR_SIZE_BYTES="null"
+if [[ -d "${S_WORKSPACE}" ]]; then
+    S_TOTAL_DIR_SIZE_BYTES=$(du -sb "${S_WORKSPACE}" | awk '{print $1}' || echo "null")
+fi
+
+S_TARGET_DIR_SIZE_BYTES="null"
+if [[ -d "${S_WORKSPACE}/target" ]]; then
+    S_TARGET_DIR_SIZE_BYTES=$(du -sb "${S_WORKSPACE}/target" | awk '{print $1}' || echo "null")
+fi
+
+
+if [[ "${S_STATUS}" -ne "0" ]]; then
+    msg "building '${S_PRODUCT_NAME}' failed!"
+else
+    msg "building '${S_PRODUCT_NAME}' completed successfully."
+fi
+
+unsetTraps ${S_TRAP_SIGNALS[@]}
+
+msg "prepare workspace for transfer:"
+
+msg "  - clean up"
+cleanUp
+
+msg "  - delete unnecessary files"
+deleteBuildObjs
+
+S_GALLERY_DIR_SIZE_BYTES="null"
+if [[ -d "${S_WORKSPACE}" ]]; then
+    S_GALLERY_DIR_SIZE_BYTES=$(du -sb "${S_WORKSPACE}" | awk '{print $1}' || echo "null")
+fi
+
+S_REPORT_FILE="${S_OUTPUT_DIR}/${S_REPORT_NAME}"
+msg "writing build report to '${S_REPORT_FILE}'."
+writeReport "${S_REPORT_FILE}"               \
+            "${S_PROFILE_CONTENTS}"          \
+            "${S_PRODUCT_NAME}"              \
+            "${S_RECIPE_REPO_INFO}"          \
+            "${S_RECIPE_REPO_SHA}"           \
+            "${S_TIMESTART}"                 \
+            "${S_TIMESTOP}"                  \
+            "${S_STATUS}"                    \
+            "${S_TOTAL_DIR_SIZE_BYTES}"      \
+            "${S_TARGET_DIR_SIZE_BYTES}"     \
+            "${S_GALLERY_DIR_SIZE_BYTES}" && \
+            S_FILES_TO_MOVE[${#S_FILES_TO_MOVE[@]}]="${S_REPORT_FILE}" && \
+            S_FILES_TO_MOVE[${#S_FILES_TO_MOVE[@]}]="${S_REPORT_NAME}"
+
+# initialize reference variable to a conservative value and then generate postdata
+S_POSTDATA_REF="json_data=%7B%7D"
+if [[ ! -z "${S_API_POST_URL}" ]]; then
+    S_API_POSTDATA_FILE="${S_OUTPUT_DIR}/${S_API_POSTDATA_NAME}"
+    msg "generating postbody for sirius hub."
+    genPostData S_POSTDATA_REF              \
+                "${S_PROFILE_CONTENTS}"     \
+                "${S_RECIPE_DIR}"           \
+                "${S_RECIPE_REPO_SHA}"      \
+                "${S_TIMESTART}"            \
+                "${S_TIMESTOP}"             \
+                "${S_STATUS}"               \
+                "${S_WORKSPACE}"            \
+                "${S_GALLERY_URL}"          \
+                "${S_API_POSTDATA_FILE}" && \
+                S_FILES_TO_MOVE[${#S_FILES_TO_MOVE[@]}]="${S_API_POSTDATA_FILE}" && \
+                S_FILES_TO_MOVE[${#S_FILES_TO_MOVE[@]}]=".${S_API_POSTDATA_NAME}"
+fi
+
+msg "  - move dangling files"
+moveDanglingFiles
+
+msg "  - ensure the gallery is set up"
+mkdir -p "${S_GALLERY_BASE_DIR}"
+S_STATUS=$?
+
+if [[ "${S_STATUS}" -eq "0" ]]; then
+
+    msg "transfer '${S_PRODUCT_NAME}' from workspace to gallery."
+    moveResults "${S_WORKSPACE}" "${S_GALLERY_BASE_DIR}"
+    S_STATUS=$?
+    if [[ "${S_STATUS}" -eq "0" ]]; then
+
+        S_LOGFILE="${S_GALLERY_DIR}/${S_LOGFILE_NAME}"
+
+        if [[ ! -z "${S_API_POST_URL}" ]]; then
+            msg "posting to sirius hub."
+            postSH  "${S_POSTDATA_REF}"   \
+                    "${S_API_POST_URL}" ||\
+                    msg "fatal error: failed to post to sirius hub! Reason: $?"
+        fi
+    else
+        msg "fatal error: trouble transfering results from workspace to gallery"
+        if [[ ! -z "${S_API_POST_URL}" ]]; then msg "not posting to sirius hub due to fatal errors! Reason: ${S_STATUS}"; fi
+    fi
+else
+    msg "fatal error: gallery is not set up!"
+    if [[ ! -z "${S_API_POST_URL}" ]]; then msg "not posting to sirius hub due to fatal errors! Reason: ${S_STATUS}"; fi
+fi
+
+exit ${S_STATUS}

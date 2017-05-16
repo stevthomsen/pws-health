@@ -1,0 +1,3 @@
+#! /bin/bash
+
+ls `lastBuiltTrunkHealthDir`/limo_dist_lp3*assert_boot_lbi_rootfs.fhx | tail -1

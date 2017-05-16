@@ -1,0 +1,10 @@
+#! /bin/bash
+
+parentProc=`head -1 $1`
+
+killTree ${parentProc}
+
+# parent may have started a child so do it again
+sleep 10
+killTree ${parentProc}
+

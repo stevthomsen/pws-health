@@ -1,0 +1,35 @@
+#!/bin/bash
+# default operating path is not production.
+if [[ "$#" -ne 1 || ! -d "$1" ]]; then
+    echo "error: please provide base working directory path."
+    exit 1
+fi
+
+_opath="$1"
+
+# setup path for sirius tools/2
+_sirius_tools=/sirius/tools2/bin:/sirius/tools/bin
+# optionally, if we are not on redhat, add sirius/tools3 and sbin
+if ! grep -o 'release \([0-6]\)' /etc/redhat-release >/dev/null 2>&1; then
+    _sirius_tools=/sirius/tools3/bin:$_sirius_tools:/sbin
+fi
+
+
+PATH=${_opath}/srcs:${_opath}/tools/bin:${_sirius_tools}:$PATH
+
+# setup vcd proxies
+NO_PROXY=127.0.0.1,localhost,.hp.com,*.hp.com,.hpicorp.net,*.hpicorp.net,15.0.0.0/9,.vcd.hp.com,*.vcd.hp.com,.vcs.rd.hpicorp.net,*.vcs.rd.hpicorp.net
+http_proxy=http://web-proxy.austin.hpicorp.net:8080
+FTP_PROXY=http://web-proxy.austin.hpicorp.net:8080
+ftp_proxy=http://web-proxy.austin.hpicorp.net:8080
+https_proxy=http://web-proxy.austin.hpicorp.net:8080
+HTTPS_PROXY=http://web-proxy.austin.hpicorp.net:8080
+no_proxy=127.0.0.1,localhost,.hp.com,*.hp.com,.hpicorp.net,*.hpicorp.net,15.0.0.0/9,.vcd.hp.com,*.vcd.hp.com,.vcs.rd.hpicorp.net,*.vcs.rd.hpicorp.net
+HTTP_PROXY=http://web-proxy.austin.hpicorp.net:8080
+
+startTrunkHealthBuild \
+    -R "git@git.vcd.hp.com:sirius_dist:trunk:${_opath}/temp/sirius_dist" \
+    -C "git@github.azc.ext.hp.com:ktang/pws-health-profiles.git:master:${_opath}/temp/pws-health-profiles" \
+    -S "${_opath}/srcs/support" \
+    -W "${_opath}/temp" \
+    -O "${_opath}/external"

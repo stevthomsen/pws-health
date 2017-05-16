@@ -1,0 +1,5 @@
+#! /bin/bash
+export ME=`whoami`
+source /users/${ME}/.proxy
+source /users/${ME}/.PATH
+/users/${ME}/bin/testBuildCITH.5 | tee /users/${ME}/buildTrunkHealth_`date -u '+%Y-%m-%d_%H_%M_%S'`.log 2>&1

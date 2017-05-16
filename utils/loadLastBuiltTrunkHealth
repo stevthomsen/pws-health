@@ -1,0 +1,6 @@
+#! /bin/bash
+
+export MYBUILTBITS=`lastBuiltTrunkHealthBits`
+echo loading ${MYBUILTBITS}
+echo make sure printer is ready
+cat ${MYBUILTBITS} > /dev/usb/lp0

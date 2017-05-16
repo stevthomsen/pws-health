@@ -1,0 +1,585 @@
+#! /bin/bash
+
+#set -x
+#set -o functrace
+
+LOGFILE_NAME=build_orchestrator.log
+WORKER=subTrunkHealthBuild
+
+DISTRO_SET=()
+
+REMOVAL_LIST=(
+    *_assert_lbi_rootfs.rfu
+    *_assert_info.json
+    *_assert_lbi.fhx
+    *_assert_lbi.fhx.info
+    *_assert_lbi_rootfs.fhx
+    *_assert_lbi_rootfs.fhx.info
+    *_assert_lbi_rootfs.ful2
+    *_assert_lib_strings_defines.h
+    *_assert_partition_boot.fhx
+    *_assert_partition_boot.fhx.info
+    *.tar.7z
+    *.bin
+    *_assert_rootfs.fhx
+    *_assert_rootfs.fhx.info
+    *_assert_rootfs.ubifs_ubi
+    *_assert_rootfs.ubifs_ubi_oob
+    *_assert_sal.tar.gz
+    *_assert_syslog_json.txt
+    target*
+    .opkg_*
+    .pseudo
+    .ipk-download
+    FW_Update*
+    simulator*
+    *.cpio.gz
+    *.hlg
+)
+
+SUPPORT_DIR=
+RECIPE_DIR=
+PROF_DIR=
+OUTPUT_DIR=`pwd`
+TEMP_DIR="/tmp/pws-health"
+
+SUPPORT_FILES_PHP="files.php"
+
+CURRENT=UTC_`date -u '+%Y-%m-%d_%H_%M'`
+MAX_PID_WAIT_TIME_SECS=-1
+MAX_STALE_DAYS=14
+MAX_PARALLEL_JOBS=-1
+GALLERY_BASE_URL="http://peftech.vcd.hp.com/pws-external/"
+API_POST_URL=
+
+CPID=$$
+
+TRAP_SIGNALS=( EXIT SIGINT SIGTERM SIGQUIT )
+
+# env $TEMP_DIR
+Usage(){
+    echo "Usage: $0"
+    echo "              -R <RS>:<RN>:PATH"
+    echo "              -C <CS>:<CN>:PATH"
+    echo "              -S PATH"
+    echo "              < -O PATH >"
+    echo "              < -W PATH >"
+    echo "              < -T SECS >"
+    echo "              < -d DISTRO >"
+    echo "              < -r GLOB >"
+    echo "              < -u >"
+    echo "              < -h >"
+    echo
+    echo "  Required Arugments:"
+    echo "      -R | --recipe_dir           Directory containing recipe files."
+    echo "                                    basic usage:"
+    echo "                                      ':::/path/to/sirius_dist'"
+    echo "                                    advanced usage:"
+    echo "                                      'git@git.vcd.hp.com:sirius_dist:trunk:/path/to/sirius_dist'"
+    echo
+    echo "      -C | --profile_dir          Directory continaing Trunk Health profiles."
+    echo "                                    basic usage:"
+    echo "                                      ':::/path/to/profiles'"
+    echo "                                    advanced usage:"
+    echo "                                      'git@github.azc.ext.hp.com:ktang/pws-health-profiles:master:/path/to/profiles'"
+    echo
+    echo "      -S | --support_dir          Directory containing 'files.php'."
+    echo
+    echo "  Optional Arguments:"
+    echo "      -O | --output_dir           Directory to place build objects."
+    echo "                                    default: 'pwd'"
+    echo
+    echo "      -W | --workspace_base_dir   Temporary workspace directory."
+    echo "                                    default: '${TEMP_DIR}'"
+    echo
+    echo "      -T | --max_retry_sec        Maximum seconds to wait before trying to run."
+    echo "                                    default: ''"
+    echo
+    echo "      -j | --max_parallel         Maximum number of parallel jobs. Use -1 unlimited."
+    echo "                                    default: ${MAX_PARALLEL_BUILDS}"
+    echo
+    echo "      -d | --distro               Specify a Trunk Health profile to build.  Repeatable."
+    echo
+    echo "      -u | --dump_removal_list    Print the list of items on the removal list and exit."
+    echo
+    echo "      -g | --gallery_base_url     Set the base gallery url."
+    echo "                                    default: ${GALLERY_BASE_URL}"
+    echo
+    echo "      -a | --api_url              Post build results to a url."
+    echo
+    echo "      -h | --help                 Output Usage message and exit."
+    echo
+    echo "  All paths need to be fully qualified (absolute paths)."
+}
+
+unsetTraps(){
+    for signal in "$@"; do
+        trap - $signal
+    done
+}
+
+# cleanUpOldBuilds :: output_dir , days_stale , search_glob
+cleanUpOld(){
+    local dir="${1}"
+    local days_stale="${2}"
+    local glob=${3}
+
+    find "${dir}" -maxdepth 1 -mtime "${days_stale}" -name "${glob}" -exec rm -r \{\} \;
+}
+
+# no_env
+lockCheck(){
+    local lockfile="${1}"
+    local pid="${2}"
+    local max_wait_time="${3}"
+
+    local elasped_wait_time=0
+    local stop_checking=0
+
+    while [ ${stop_checking} -eq 0 ]
+    do
+        if [ ! -f "$lockfile" ]; then
+            # create our lockfile
+            echo "$pid" > "$lockfile"
+
+            # Check if won
+            local file_pid=$(<"$lockfile")
+            if [ "$pid" -eq "${file_pid}" ]; then
+		stop_checking=1
+            else
+		echo "contention - another conductor running?"
+            fi
+	else # delay and retry if not beyond time limit
+            echo "lock file already exists, another conductor's territory?"
+	    if [ ${max_wait_time} -ne -1 ]; then
+		if [ ${elasped_wait_time} -lt ${max_wait_time} ]; then
+		    elasped_wait_time=$(( ${elasped_wait_time} + 1 ))
+		    sleep 1 &
+                    wait $!
+		fi
+	    else # retry forever
+		sleep 1 &
+                wait $!
+	    fi
+	fi
+    done
+}
+
+# env $LOGFILE
+logMsg(){
+    local fp="$1"
+    local sp="$2"
+    local msg="$3"
+    local lfile="$LOGFILE"
+
+    local smsg=""
+    if [ "$sp" -ne 0 ]; then
+        printf -v smsg '[ %6s ] > [ %6s ] %s' "$fp" "$sp" "$msg"
+    else
+        printf -v smsg '[ %6s ]              %s' "$fp" "$msg"
+    fi
+
+    if [[ -f "$lfile" ]]; then
+        echo "${smsg}" | tee -a "${lfile}"
+    else
+        echo "${smsg}" >> "/dev/stdout"
+    fi
+}
+
+# no_env
+moveResults(){
+    local src="${1}"
+    local dst="${2}"
+    local basename="${src##*/}"
+
+    if [ -d "${src}" ] ; then
+        # if the dir already exists at the dest then mv the contents and then delete src dir.
+        if [ -d "${dst}/${basename}" ] ; then
+            mv "${src}"/* "${dst}/${basename}/"
+            rmdir "${src}"
+        # else move the entire thing.
+        else
+            mv "${src}" "${dst}"
+        fi
+    else
+	echo "Cannot move results to ${dst}."
+	exit 42
+    fi
+}
+
+# env $CPID, $DISTRO_SET, $WORKSPACE, $OUTPUT_DIR
+trapCleanUp(){
+    # check if parent or child
+    if [[ $$ -eq ${CPID} ]]; then
+        echo -e "\n\ncleaning up...\n"
+        local pids=$(jobs -pr)
+        if [ -n "$pids" ]; then
+            echo $pids | xargs kill -SIGINT
+            echo "killing workers:"
+            for pid in $pids; do
+                printf "  signal [ %6s ] ... " "$pid"
+                wait $pid
+                printf "dead ( %3s )\n" $?
+            done
+            echo ""
+        fi
+
+        logMsg ${CPID} 0 "conductor - transfer workspace to gallery."
+        moveResults "${WORKSPACE}" "${OUTPUT_DIR}"
+        [ -f "$LOCK_FILE" ] && rm -f "$LOCK_FILE"
+    fi
+}
+
+# no_env
+checkDirectory_or_Repo(){
+    # check possible repo directories
+    local dir="${1}"
+    local name="${2}"
+    local server="${3}"
+    local branch="${4}"
+
+    if [[ -d "${dir}" ]]; then
+        if [[ "x${name}" != "x" ]]; then
+            if [[ -d "${dir}/.git" ]]; then
+                local remote=$(git -C "${dir}" ls-remote --get-url origin)
+                local haz_branch=$(git -C "${dir}" ls-remote --exit-code --heads "${remote}" "${branch}" > /dev/null 2>&1)$?
+                local remoteName=${remote##*:}
+                if [[ "x${remoteName}" == "x${name}" && "x${branch}" != "x" && "${haz_branch}" -eq 0 ]]; then
+                    echo "cleansing repo '${remoteName}'..."
+                    # currently assumes that master is named 'trunk'
+                    git -C "${dir}" reset --hard "origin/${branch}"
+                    echo "pulling latest changes..."
+                    git -C "${dir}" pull
+                else
+                    echo "repo '${remoteName}' does not match expected repo of '${name}' or..."
+                    echo "repo '${branch}' does not exist in repo '${remote}'."
+                    return 50
+                fi
+            elif [[ "x${server}" != "x" ]]; then
+                echo "repo '${server}:${name}' does not exist, cloning a new copy..."
+                git clone "${server}:${name}" "${dir}"
+                git -C "${dir}" pull
+            else
+                echo "repo does not exist at '${dir}'."
+                echo "repo name '${name}' was provided."
+                echo "repo server was NOT provided."
+            fi
+        # do nothing if not a repo
+        fi
+    else
+        echo "directory '${dir}' does not exist."
+        return 51
+    fi
+    return 0
+}
+
+# no_env
+doBuilds(){
+    local ppid="${1}"
+    local worker="${2}"
+    local outdir="${3}"
+    local recipedir="${4}"
+    local yamldir="${5}"
+    local filesphp="${6}"
+    local max_workers="${7}"
+    local gallery_dir="${8}"
+    local gallery_base_url="${9}"
+    local api_post_url="${10}"
+    local temp_da=${11}[@]
+    local temp_di=${12}[@]
+    local -a deletions=("${!temp_da}")
+    local -a distros=("${!temp_di}")
+    local num_distros=${#distros[@]}
+    local -a worker_pids=()
+
+    logMsg ${ppid} 0 "conductor - initialized."
+    logMsg ${ppid} 0 "conductor - start a new cycle."
+
+    for profile in "${yamldir}"/*.yaml; do
+        if [ -f "$profile" ]; then
+            local found=1
+            local tpn="${profile##*/}"
+            local product_name="${tpn%.yaml}"
+            local num_non_null=${#distros[@]}
+
+            # are there any specified distros?
+	    if [ ${num_distros} -ne 0 ]; then
+                found=0
+                # are there any specified distros left to find?
+		if [ ${num_non_null} -ne 0 ]; then
+                    for (( j=0; j < ${num_distros}; j++ )); do
+			if [ "${distros[$j]}" = "${product_name}" ]; then
+                            unset distros[$j]
+                            found=1
+                            break
+                        fi
+                    done
+                fi
+            fi
+
+            # if we didnt find anything, skip this profile file.
+            if [ $found -ne 1 ]; then
+                continue
+            fi
+
+            # limit max number of active jobs
+            if [[ ${max_workers} -gt -1 && ${#worker_pids[@]} -ge ${max_workers} ]]; then
+                logMsg ${ppid} ${spid} "conductor - job queue saturated - '${product_name}' is waiting for another job to complete."
+                while [[ ${#worker_pids[@]} -ge ${max_workers} ]]; do
+                    sleep 2
+                    for pidx in ${!worker_pids[@]}; do
+                        if ! ps -p ${worker_pids[${pidx}]} > /dev/null ; then
+                            unset -v worker_pids[${pidx}]
+                        fi
+                    done
+                done
+                logMsg ${ppid} ${spid} "conductor - opening in job queue - submitting '${product_name}' job."
+            fi
+
+            (
+                local wpid=${BASHPID}
+                (
+                    "${worker}"               \
+                        "${product_name}"     \
+                        "${profile}"          \
+                        "${recipedir}"        \
+                        "${outdir}"           \
+                        "${filesphp}"         \
+                        "${gallery_dir}"      \
+                        "${gallery_base_url}" \
+                        "${api_post_url}"     <<EOF
+${deletions[@]}
+EOF
+                ) &
+
+                local tpid=$!
+                logMsg ${wpid} ${tpid} "worker - gave job '${product_name}' to worker [ ${tpid} ]."
+                logMsg ${tpid} 0 "worker - started job '${product_name}'."
+
+                wait $tpid
+
+                local ec=$?
+                if [ "$ec" -ne 0 ]; then
+                    logMsg ${tpid} 0 "worker - stopped job '${product_name}'. Reason: ${ec}"
+                    exit 10
+                fi
+                logMsg ${tpid} 0 "worker - completed job '${product_name}'."
+            ) &
+
+            local spid=$!
+            worker_pids[${#worker_pids[@]}]=${spid}
+
+            logMsg ${ppid} ${spid} "conductor - gave job '${product_name}' to worker [ ${spid} ]."
+        fi
+    done
+
+    # feedback any explicitly specified distros that we did not find
+    for leftover in ${distros[@]}; do
+        logMsg ${ppid} 0 "conductor - non-existent profile: '${leftover}'."
+    done
+
+    if [ ${#worker_pids[@]} -ne 0 ];then
+    # wait for all children to finish
+	wait
+	logMsg ${ppid} 0 "conductor - workers have finished."
+    else
+	logMsg ${ppid} 0 "conductor - no workers started."
+    fi
+}
+
+#
+# main
+#
+NUM_REMOVAL_LIST=${#REMOVAL_LIST[@]}
+while [[ $# -gt 0 ]]; do
+    switch="$1"
+    case $switch in
+        -R|--recipe_dir)
+            tr0="${2//[^:]}"
+            if [[ "${#tr0}" -ne 3 ]]; then
+		echo "Invalid switch: $1 $2"
+                Usage
+                exit 1
+            fi
+            tr1="${2%:*}"
+            tr2="${tr1%:*}"
+            tr3="${tr2%:*}"
+            RECIPE_DIR="${2##*:}"
+            RECIPE_REPO_BRANCH="${tr1##*:}"
+            RECIPE_REPO_NAME="${tr2##*:}"
+            RECIPE_REPO_SERVER="${tr3##*:}"
+            shift
+            ;;
+        -C|--profile_dir)
+            pr0="${2//[^:]}"
+            if [[ "${#pr0}" -ne 3 ]]; then
+                Usage
+                exit 1
+            fi
+            pr1="${2%:*}"
+            pr2="${pr1%:*}"
+            pr3="${pr2%:*}"
+            PROF_DIR="${2##*:}"
+            PROF_REPO_BRANCH="${pr1##*:}"
+            PROF_REPO_NAME="${pr2##*:}"
+            PROF_REPO_SERVER="${pr3##*:}"
+            shift
+            ;;
+        -S|--support_dir)
+            SUPPORT_DIR="${2}"
+            shift
+            ;;
+        -O|--output_dir)
+            OUTPUT_DIR="$2"
+            shift
+            ;;
+        -T|--max_retry_sec)
+            MAX_PID_WAIT_TIME_SECS="$2"
+            shift
+            ;;
+        -W|--workspace_base_dir)
+            TEMP_DIR="$2"
+            shift
+            ;;
+        -j|--max_parallel)
+            MAX_PARALLEL_JOBS="$2"
+            shift
+            ;;
+        -d|--distro)
+            DISTRO_SET[${#DISTRO_SET[@]}]="$2"
+            shift
+            ;;
+        -r|--removal_exclude)
+            to_exclude="$2"
+            for (( j=0; j < $NUM_REMOVAL_LIST; j++ )); do
+                item=${REMOVAL_LIST[$j]}
+                if [ "$item" = "$to_exclude" ]; then
+                    unset REMOVAL_LIST[$j]
+                fi
+            done
+            shift
+            ;;
+        -u|--dump_removal_list)
+            echo "The removal list entails:"
+            for R in "${REMOVAL_LIST[@]}"; do
+                echo "  ${R}"
+            done
+            exit 0
+            shift
+            ;;
+        -g|--gallery_base_url)
+            GALLERY_BASE_URL="$2"
+            shift
+            ;;
+        -a|--api_url)
+            API_POST_URL="$2"
+            shift
+            ;;
+        -h|--help)
+	    Usage
+            exit 0
+            shift
+            ;;
+        *)
+            echo "unknown option '${switch}'."
+            exit 1
+            ;;
+    esac
+    shift    
+done
+
+# make sure that we have all required arguments
+if [[ -z "$RECIPE_DIR" || -z "$PROF_DIR" || -z "$SUPPORT_DIR" ]]; then
+    Usage
+    exit 1
+fi
+
+# set up workspace directories
+PROJECTED_GALLERY_URL="${GALLERY_BASE_URL}${CURRENT}/"
+GALLERY_DIR="${OUTPUT_DIR}/${CURRENT}"
+WORKSPACE="${TEMP_DIR}/${CURRENT}"
+if [ ! -d "${WORKSPACE}" ] ; then
+    mkdir -p "${WORKSPACE}"
+    if [ "$?" -ne 0 ] ; then
+        logMsg ${CPID} 0 "conductor - failed to create workspace area."
+        exit 3
+    fi
+else
+    logMsg ${CPID} 0 "conductor - workspace is occupied."
+    exit 3
+fi
+
+# Ensure no contention
+LOCK_FILE="${TEMP_DIR}/startTrunkHealthBuild.lock"
+lockCheck "$LOCK_FILE" "$CPID" "$MAX_PID_WAIT_TIME_SECS"
+
+trap 'unsetTraps "${TRAP_SIGNALS[@]}" ; trapCleanUp' ${TRAP_SIGNALS[@]}
+
+# set up build object final destination
+if [ ! -d "${OUTPUT_DIR}" ] ; then
+    mkdir -p "${OUTPUT_DIR}"
+    if [ "$?" -ne 0 ] ; then
+	echo "${OUTPUT_DIR} does not exist and cannot be made."
+	exit 3
+    fi
+fi
+
+LOGFILE="${WORKSPACE}/${LOGFILE_NAME}"
+if [ -f "${LOGFILE}" ] ; then
+    rm -rf "${LOGFILE}"
+fi
+: >"${LOGFILE}"
+echo -e "\nLogging started in '${LOGFILE}'...\n"
+
+checkDirectory_or_Repo "${RECIPE_DIR}"         \
+                       "${RECIPE_REPO_NAME}"   \
+                       "${RECIPE_REPO_SERVER}" \
+                       "${RECIPE_REPO_BRANCH}" || exit $?
+
+checkDirectory_or_Repo "${PROF_DIR}"           \
+                       "${PROF_REPO_NAME}"     \
+                       "${PROF_REPO_SERVER}"   \
+                       "${PROF_REPO_BRANCH}"   || exit $?
+
+if [[ -d "${SUPPORT_DIR}" && -f "${SUPPORT_DIR}/${SUPPORT_FILES_PHP}" ]] ; then
+    #if [[ ! -L "${OUTPUT_DIR}/${SUPPORT_FILES_PHP}" ]]; then
+    #    ln -s "${SUPPORT_DIR}/${SUPPORT_FILES_PHP}" "${OUTPUT_DIR}/${SUPPORT_FILES_PHP}"
+    #fi
+    SUPPORT_FILES_PHP="${SUPPORT_DIR}/${SUPPORT_FILES_PHP}"
+else
+    logMsg ${CPID} 0 "conductor - support file ${SUPPORT_FILES_PHP} does not exist."
+    exit 3
+fi
+
+# start the builds
+# conductor's pid - used for logging
+# worker script to execute each build
+# root of build workspace
+# directory of sirius_dist
+# directory of trunk health yaml profiles
+# if non-empty, the set of distros to build (must have matching profile)
+# set of build object file globs to delete
+
+doBuilds "${CPID}"                  \
+         "${WORKER}"                \
+         "${WORKSPACE}"             \
+         "${RECIPE_DIR}"            \
+         "${PROF_DIR}"              \
+         "${SUPPORT_FILES_PHP}"     \
+         "${MAX_PARALLEL_JOBS}"     \
+         "${GALLERY_DIR}"           \
+         "${PROJECTED_GALLERY_URL}" \
+         "${API_POST_URL}"          \
+         REMOVAL_LIST               \
+         DISTRO_SET
+
+# move any remaining objects to the final destination
+logMsg ${CPID} 0 "conductor - transfer workspace to gallery."
+moveResults "${WORKSPACE}" "${OUTPUT_DIR}"
+
+unsetTraps ${TRAP_SIGNALS[@]}
+
+cleanUpOld "$OUTPUT_DIR" "$MAX_STALE_DAYS" "UTC_*"
+[ -f "$LOCK_FILE" ] && rm -f "$LOCK_FILE"
+
+exit 0

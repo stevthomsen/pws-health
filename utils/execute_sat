@@ -1,0 +1,172 @@
+#!/bin/sh
+#Description : Script to execute the SAT for the build.
+
+#Modification History
+#---------------------------------------------------------------------------------------
+#Date         Description
+#
+#---------------------------------------------------------------------------------------
+
+#Enable to debug
+#set -x 
+
+VPRINTERMANAGER_CREATE_CMD="vprintermanager create -p"
+VPRINTERMANAGER_BUILD_CMD="vprintermanager buildfw -i"
+VPRINTERMANAGER_DELETE_CMD="vprintermanager delete -i"
+VPRINTERMANAGER_SETBUILDMODE_CMD="vprintermanager setbuildmode -i"
+VPRINTERMANAGER_GETPATH_CMD="vprintermanager info -g"
+VTESTER_EXECUTE_CMD="vtester executetests -i"
+
+SPEC_PATH="/sirius/work/$USER/VPrinterManager/VPrinterManager"
+LOG_FILE_NAME=""
+
+#Global variable to hold the 
+VPRINTER_ID=""
+STRING_TO_FIND="pre_built_artifacts_url"
+
+# Helper functions for the script processing.
+
+# Function Name: 
+# Description
+HandleFailure()
+{
+  if [ $1 -ne 0 ];then
+    echo "$VPRINTER_ID: $2 failed error status: $1"
+    echo "$VPRINTER_ID: $2 failed error status: $1" >> $LOG_FILE_NAME
+    # Delete the vprinter instance
+    $VPRINTERMANAGER_DELETE_CMD $VPRINTER_ID
+    exit 1
+  fi
+}
+
+# Function Name: 
+# Description
+ExecuteCommand()
+{
+	echo "Executing $1.........." >> $LOG_FILE_NAME
+  if [ x"$1" != x ];then
+    $1 >> $LOG_FILE_NAME 2>&1
+    HandleFailure $? $1
+  fi
+
+}
+
+# Function Name: 
+# Description
+validate_profile()
+{
+  echo "TODO: Validate the profile provided by user and vprintermanager supported profiles"
+}
+
+# Local functions for executing SAT
+
+# Function Name: 
+# Description
+CreateVPrinterManagerInstance()
+{
+  VPRINTER_INSTANCE_CREATE_CMD="${VPRINTERMANAGER_CREATE_CMD} $PROFILE -i $VPRINTER_ID"
+  ExecuteCommand "$VPRINTER_INSTANCE_CREATE_CMD"
+}
+
+# Function Name: 
+# Description
+SetBuildModeForVPrinterInstance()
+{
+
+  SETBUILD_MODE_CMD="$VPRINTERMANAGER_SETBUILDMODE_CMD $VPRINTER_ID local"
+  ExecuteCommand "$SETBUILD_MODE_CMD"
+
+  sleep 7
+  #TODO: Use the vprintermanager to get the base path.
+  FW_SPEC_FILE="$SPEC_PATH/VPrinters/$VPRINTER_ID/Profile/specfiles/${PROFILE}_fwbuild_spec.json"
+
+  if [ ! -f $FW_SPEC_FILE ];then
+    HandleFailure 1 "$FW_SPEC_FILE NOT FOUND"
+  fi
+
+  # Replace the content of the $STRING_TO_FIND from NULL to desired path.
+  sed "/$STRING_TO_FIND/s/null/\"${FW_PREBUILT_ARTIFACTS//\//\\/}\"/g" -i $FW_SPEC_FILE
+
+  HandleFailure $? "$STRING_TO_FIND UPDATE"
+}
+
+# Function Name: 
+# Description
+BuildVPrinterInstance()
+{
+  BUILD_CMD="$VPRINTERMANAGER_BUILD_CMD $VPRINTER_ID"
+  ExecuteCommand "$BUILD_CMD"
+}
+
+# Function Name: 
+# Description
+ConfigureVTester()
+{
+  #TODO: Configure email registration
+	echo "Test"
+}
+
+# Function Name: 
+# Description
+LaunchSAT()
+{
+  VT_CMD="$VTESTER_EXECUTE_CMD $VPRINTER_ID"
+  ExecuteCommand "$VT_CMD"
+}
+
+EnableLogging()
+{
+  LOG_FILE_NAME="${VPRINTER_ID}.log"
+  echo > $LOG_FILE_NAME
+}
+
+# Function Name: 
+# Description
+Usage()
+{
+  echo "Usage:"
+  echo "    -p|--profile [ PROFILE_NAME ]"
+  echo "    -d|--path [FW_PREBUILT_ARTIFACTS]" 
+  echo "    -h|--help"
+}
+
+# Entry point for SAT execution
+# TODO: Options can be of in the format of --help etc
+while true ; do
+  case "$1" in
+    -p|--profile)
+      case "$2" in
+        "") Usage ; exit 1; shift 2 ;;
+        *)  PROFILE="$2" ;  shift 2 ;;
+      esac;;
+    -b|--build) BUILD_TYPE=$2; shift 2 ;;
+    -d|--path)  
+      case "$2" in
+        "") Usage ; exit 1; shift 2 ;;
+        *)  FW_PREBUILT_ARTIFACTS=$2; shift 2 ;;
+      esac;;
+    -h|--help)  Usage ; exit 1; shift 1 ;;
+    *) Usage echo "Error" ; exit 1 ;;
+  esac
+
+  #Bailout of while loop
+  [ "$1" != "" ] || break
+done
+
+VPRINTER_ID="${PROFILE}_`date +%Y%m%d%H%M`"
+
+#Enable the logging
+EnableLogging
+
+#Create the vprinter instance for running the SAT test.
+CreateVPrinterManagerInstance
+
+#Set the build mode for VPrinter Instance
+SetBuildModeForVPrinterInstance
+
+#Build the VPrinter Instance
+BuildVPrinterInstance
+
+#Launch the SAT execution
+LaunchSAT
+

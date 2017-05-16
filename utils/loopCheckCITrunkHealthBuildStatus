@@ -1,0 +1,8 @@
+#! /bin/bash
+
+checkCITrunkBuildStatus
+while [ "$?" -eq "2" ] ; do
+    sleep 5
+    echo -en $'\e'[A
+    checkCITrunkBuildStatus
+done

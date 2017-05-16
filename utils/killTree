@@ -1,0 +1,23 @@
+#! /bin/bash
+
+Usage(){
+    echo "Usage: $0 PID-of-tree-to-kill"
+}
+
+if [ $# -ne 1 ] ; then
+    Usage
+    exit 1
+fi
+
+pids=( `ps -T o pid,ppid,tty,comm | fgrep $1 | awk '{print $1}'` )
+
+for I in "${pids[@]}"
+do
+    #echo $I
+    if [ $I -ne $1 ] ; then
+	#echo Tree Killing $I
+	killTree $I
+    fi
+done
+#echo "self killing $1"
+kill -SIGTRAP $1

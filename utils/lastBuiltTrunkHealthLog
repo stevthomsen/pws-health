@@ -1,0 +1,4 @@
+#! /bin/bash
+
+Dir=`lastBuiltTrunkHealthDir`
+echo "${Dir}/build_limo_lp3.log"

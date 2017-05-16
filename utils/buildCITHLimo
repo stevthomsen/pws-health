@@ -1,0 +1,31 @@
+#! /bin/bash
+
+Usage(){
+    echo "Usage: $0"
+    echo "Usage: $0 help"
+}
+
+if [ $# -gt 1 ] ; then
+    Usage
+    exit 1
+fi
+
+if [ $# -eq 1 ] ; then
+    Usage
+    if [ $1 = "help" ] ; then
+	exit 0
+    else
+	exit 1
+    fi
+fi
+
+# Make sure no contention
+triggerCheck $HOME/buildProcessID
+
+/work/thomsen/pws-health/startTrunkHealthBuild -d limo_lp3 \
+    -R /work/thomsen/sirius_dist \
+    -O /work/thomsen/CITrunkHealthBuildLimo \
+    -C /work/thomsen/CITrunkHealthRecipes 
+
+# Clean up
+rm -f $HOME/buildProcessID

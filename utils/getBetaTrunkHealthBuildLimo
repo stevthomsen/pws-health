@@ -1,0 +1,162 @@
+#! /bin/bash
+
+# Setup stuff for cron
+export ME=`whoami`
+source /users/${ME}/.proxy
+source /users/${ME}/.PATH
+
+BASE=http://peftech.vcd.hp.com/pws-external/
+Distro=limo_lp3
+masterBuildLog=build_orchestrator.log
+buildFound=1
+
+checkForCompletion(){
+    buildFound=1
+    wget --no-check-certificate ${BASE}/$1/${masterBuildLog}
+    if [ "$?" -ne 0 ] ; then
+	echo "No build in $1"
+    else
+	fgrep "completed job" ${masterBuildLog} | fgrep "${Distro}"
+	if [ "$?" -ne 0 ] ; then
+	    echo "${Distro} not completed in $1"
+	else
+	    buildFound=0
+	fi
+    fi
+    rm -rf ${masterBuildLog}
+}
+
+Usage(){
+    echo "Usage $0: [distro-to-get] [-h]"
+    echo "    Distro examples: limo_lp3 (default)"
+    echo "                     limo_cp_lp3"
+    echo "                     limo_mp1"
+    echo "                     limo_cp_mp1"
+    echo "                     maverickhidw_ofax_mp2"
+    echo "    -h Output help"
+}
+
+checkArgs(){
+    myArgs=( "$@" )
+    if [ "${myArgs[$i]}" = -h ] ; then
+	Usage
+	exit 0
+    else
+	Distro=$1
+    fi
+}
+
+if [ $# -gt 1 ] ; then
+    Usage
+    exit 201
+fi
+
+if [ $# -lt 0 ] ; then # paranoia
+    Usage
+    exit 202
+fi
+
+if [ $# -eq 1 ] ; then # more paranoia
+    checkArgs "$@" 
+fi
+
+# Change to directory for Trunk Health Bits local storage
+Place=/users/${ME}/TrunkHealthBits
+if [ ! -d ${Place} ] ; then
+    mkdir -p ${Place}
+    if [ "$?" -ne 0 ] ; then
+	echo "Cannot mkdir ${Place}"
+	exit 222
+    fi
+fi
+cd ${Place}
+if [ "$?" -ne 0 ] ; then
+    echo "Cannot cd to ${Place}"
+    echo 223
+fi
+
+# Get the place for the latest Beta Trunk Health Build
+rm -f z
+curl -k  ${BASE} > z
+buildFound=1
+BUILDS=`fgrep UTC_ z | \
+    sed -e 's,<img src="/icons/folder.gif" alt="\[DIR\]"> <a href=",,g'| \
+    sed -e 's,/, ,g' | awk '{print $1}'`
+for I in ${BUILDS}
+do
+    checkForCompletion $I
+    if [ ${buildFound} -eq 0 ] ; then
+	BUILD=$I
+	break
+    fi
+done
+
+DistroDir=${BASE}/${BUILD}/${Distro}
+if [ -e ${Distro} ] ; then
+    rm -rf ${Distro}
+    if [ "$?" -ne 0 ] ; then
+	echo "${Distro} exists and cannot be removed"
+	exit 224
+    fi
+fi
+wget --no-check-certificate ${DistroDir}
+
+# Get the log file
+Log=`fgrep build_${Distro}.log ${Distro} | \
+    sed -e 's,<img src="/icons/unknown.gif" alt="\[   \]"> <a href=",,g' | \
+    sed -e 's,", ,' | awk '{print $1}'`
+if [ -e ${Log} ] ; then
+    rm -rf ${Log}
+    if [ "$?" -ne 0 ] ; then
+	echo "${Log} exists and cannot be removed"
+	exit 225
+    fi
+fi
+echo "Getting Log ${Log}"
+wget --no-check-certificate ${DistroDir}/${Log}
+
+# Get printer bits
+Bits=`fgrep lbi_rootfs.fhx ${Distro} | grep -v lbi_rootfs.fhx.info | \
+    sed -e 's,<img src="/icons/unknown.gif" alt="\[   \]"> <a href=",,g' | \
+    sed -e 's,", ,' | awk '{print $1}'`
+if [ -e ${Bits} ] ; then
+    rm -rf ${Bits}
+    if [ "$?" -ne 0 ] ; then
+	echo "${Bits} exists and cannot be removed"
+	exit 225
+    fi
+fi
+echo "Getting Bits ${Bits}"
+wget --no-check-certificate ${DistroDir}/${Bits}
+
+# Get .all file for sift/FlexScript
+All=`fgrep all ${Distro} | \
+    sed -e 's,<img src="/icons/unknown.gif" alt="\[   \]"> <a href=",,g' | \
+    sed -e 's,", ,' | awk '{print $1}'`
+if [ -e ${All} ] ; then
+    rm -rf ${All}
+    if [ "$?" -ne 0 ] ; then
+	echo "${All} exists and cannot be removed"
+	exit 226
+    fi
+fi
+echo "Getting All ${All}"
+wget --no-check-certificate ${DistroDir}/${All}
+
+# Get .yaml file for building later
+Yaml=`fgrep yaml ${Distro} | \
+    sed -e 's,<img src="/icons/unknown.gif" alt="\[   \]"> <a href=",,g' | \
+    sed -e 's,", ,' | awk '{print $1}'`
+if [ -e ${Yaml} ] ; then
+    rm -rf ${Yaml}
+    if [ "$?" -ne 0 ] ; then
+	echo "${Yaml} exists and cannot be removed"
+	exit 227
+    fi
+fi
+echo "Getting Yaml ${Yaml}"
+wget --no-check-certificate ${DistroDir}/${Yaml}
+
+# Clean up
+rm ${Distro}
+rm -f z
